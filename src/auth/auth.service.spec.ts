@@ -95,6 +95,13 @@ describe('AuthService', () => {
       expect(result).not.toHaveProperty('password');
       expect(result).toHaveProperty('email');
       expect((result as User).role).toBe('user');
+
+      const created = mockUserRepository.create.mock.results[0].value as {
+        password: string;
+      };
+      const bcrypt = await import('bcrypt');
+      expect(created.password).not.toBe(dto.password);
+      expect(await bcrypt.compare(dto.password, created.password)).toBe(true);
     });
 
     it('should throw ConflictException when email exists', async () => {
@@ -129,6 +136,27 @@ describe('AuthService', () => {
       await expect(
         service.login({ email: baseUser.email, password: 'secret123' }),
       ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('should allow login when lock has expired', async () => {
+      const bcrypt = await import('bcrypt');
+      const user = {
+        ...baseUser,
+        password: await bcrypt.hash('secret123', 4),
+        lockedUntil: new Date(Date.now() - 1000),
+        failedLoginAttempts: 3,
+      };
+      mockUserRepository.findOneBy.mockResolvedValue(user);
+      mockUserRepository.save.mockResolvedValue(user);
+
+      const result = await service.login({
+        email: user.email,
+        password: 'secret123',
+      });
+
+      expect(result).toHaveProperty('access_token');
+      expect(user.failedLoginAttempts).toBe(0);
+      expect(user.lockedUntil).toBeNull();
     });
 
     it('should throw UnauthorizedException on wrong password and increment attempts', async () => {
@@ -224,6 +252,30 @@ describe('AuthService', () => {
         service.refresh({ refresh_token: oldToken }),
       ).rejects.toThrow(UnauthorizedException);
     });
+
+    it('should throw UnauthorizedException when user not found', async () => {
+      mockJwtService.verifyAsync.mockResolvedValue({
+        sub: 999,
+        type: 'refresh',
+      });
+      mockUserRepository.findOneBy.mockResolvedValue(null);
+
+      await expect(service.refresh({ refresh_token: 'tok' })).rejects.toThrow(
+        UnauthorizedException,
+      );
+    });
+
+    it('should throw UnauthorizedException when user has no refresh token hash', async () => {
+      mockJwtService.verifyAsync.mockResolvedValue({ sub: 1, type: 'refresh' });
+      mockUserRepository.findOneBy.mockResolvedValue({
+        ...baseUser,
+        refreshTokenHash: null,
+      });
+
+      await expect(service.refresh({ refresh_token: 'tok' })).rejects.toThrow(
+        UnauthorizedException,
+      );
+    });
   });
 
   describe('logout', () => {
@@ -236,6 +288,15 @@ describe('AuthService', () => {
 
       expect(result).toEqual({ message: 'Berhasil logout' });
       expect(user.refreshTokenHash).toBeNull();
+    });
+
+    it('should still succeed when user not found', async () => {
+      mockUserRepository.findOneBy.mockResolvedValue(null);
+
+      const result = await service.logout(999);
+
+      expect(result).toEqual({ message: 'Berhasil logout' });
+      expect(mockUserRepository.save).not.toHaveBeenCalled();
     });
   });
 
@@ -280,6 +341,9 @@ describe('AuthService', () => {
         ...baseUser,
         passwordResetTokenHash: tokenHash,
         passwordResetExpiresAt: new Date(Date.now() + 60000),
+        failedLoginAttempts: 4,
+        lockedUntil: new Date(Date.now() + 60000),
+        refreshTokenHash: 'old-refresh-hash',
       };
       mockUserRepository.findOneBy.mockResolvedValue(user);
       mockUserRepository.save.mockResolvedValue(user);
@@ -293,6 +357,9 @@ describe('AuthService', () => {
       expect(await bcrypt.compare('newpass123', user.password)).toBe(true);
       expect(user.passwordResetTokenHash).toBeNull();
       expect(user.passwordResetExpiresAt).toBeNull();
+      expect(user.refreshTokenHash).toBeNull();
+      expect(user.failedLoginAttempts).toBe(0);
+      expect(user.lockedUntil).toBeNull();
     });
 
     it('should throw BadRequestException on expired token', async () => {
@@ -309,6 +376,25 @@ describe('AuthService', () => {
       await expect(
         service.resetPassword({ token, password: 'newpass123' }),
       ).rejects.toThrow(BadRequestException);
+    });
+  });
+
+  describe('validateUser', () => {
+    it('should return user when found', async () => {
+      mockUserRepository.findOneBy.mockResolvedValue(baseUser);
+
+      const result = await service.validateUser(1);
+
+      expect(result).toEqual(baseUser);
+      expect(mockUserRepository.findOneBy).toHaveBeenCalledWith({ id: 1 });
+    });
+
+    it('should throw UnauthorizedException when user not found', async () => {
+      mockUserRepository.findOneBy.mockResolvedValue(null);
+
+      await expect(service.validateUser(999)).rejects.toThrow(
+        UnauthorizedException,
+      );
     });
   });
 });
